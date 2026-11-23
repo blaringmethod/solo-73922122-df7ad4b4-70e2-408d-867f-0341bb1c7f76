@@ -60,6 +60,8 @@
         {% for cause in causes|sort %}<th class="num">{{ cause }}</th>{% endfor %}
         <th class="num">待查</th>
         <th>待查格</th>
+        <th class="num">免补</th>
+        <th class="num">可补</th>
         <th></th>
       </tr>
     </thead>
@@ -74,12 +76,29 @@
         {% endfor %}
         <td class="num {% if d.unsplit > 0 %}warn{% endif %}">{{ d.unsplit }}</td>
         <td>{% if d.unsplit_count %}{{ d.unsplit_count }} 格待查{% else %}—{% endif %}</td>
+        <td class="num">
+          {% if d.exempt_causes %}
+            {% if d.exempt_causes|length == 1 %}
+              <a href="{{ url_for('exemption', date=d.date, cause=d.exempt_causes[0]) }}">{{ d.exempt }}</a>
+            {% else %}{{ d.exempt }}{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td class="num {% if d.compensable > 0 %}warn{% endif %}">
+          {% if d.exempt_causes %}
+            {% if d.exempt_causes|length == 1 %}
+              <a href="{{ url_for('exemption', date=d.date, cause=d.exempt_causes[0]) }}">{{ d.compensable }}</a>
+            {% else %}{{ d.compensable }}{% endif %}
+          {% else %}—{% endif %}
+        </td>
         <td><a href="{{ url_for('day_detail', turbine=selected, date=d.date) }}">明细</a></td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
-  <p class="hint">损失合计 = 该日各格（可发量 − 实发量）之和；各原因 + 待查应等于该合计。</p>
+  <p class="hint">
+    损失合计 = 该日各格（可发量 − 实发量）之和；各原因 + 待查应等于该合计。
+    免补 / 可补按“月份 + 原因”的全场额度核算，详见 <a href="{{ url_for('exemption') }}">免补核算</a>。
+  </p>
   {% endif %}
 </section>
 

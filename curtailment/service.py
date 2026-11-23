@@ -1,13 +1,15 @@
-"""业务服务层：导入计量表、提交/更正限发单、按日重算归因。"""
+"""业务服务层：导入计量表、提交/更正限发单、按日重算归因、免补额度核算。"""
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Iterable, Optional, Sequence
 
 from .allocation import (
+    QUANT,
     Conflict,
     DayResult,
     Interval,
@@ -19,13 +21,16 @@ from .allocation import (
     to_decimal,
     validate_order,
 )
-from .db import tx
+from .db import snapshot, tx
+from .exemption import compute_day, from_mills, to_mills
 from .parsing import (
     MeterRow,
     canonical,
     day_bounds,
     expected_slots,
+    month_bounds,
     next_date,
+    parse_date,
     parse_order_time,
     parse_utc,
 )
@@ -328,15 +333,433 @@ def recompute_day(conn: sqlite3.Connection, turbine: str, date: str) -> Optional
     return day
 
 
+def _turbines_with_attribution(conn: sqlite3.Connection, date: str) -> list[str]:
+    """该日已存归因的风机（计量被删除后也要清掉其旧结果与免补合计）。"""
+    return [
+        row["turbine"]
+        for row in conn.execute(
+            "SELECT DISTINCT turbine FROM attribution_slots WHERE date = ? ORDER BY turbine",
+            (date,),
+        )
+    ]
+
+
 def recompute_dates(conn: sqlite3.Connection, dates: Iterable[str]) -> list[DayResult]:
     """只重算给定日期：这些日期中有计量数据的每台风机各重算整日。"""
+    dates = sorted(set(dates))
     days: list[DayResult] = []
-    for date in sorted(set(dates)):
-        for turbine in _turbines_with_meters(conn, date):
+    for date in dates:
+        turbines = set(_turbines_with_meters(conn, date)) | set(
+            _turbines_with_attribution(conn, date)
+        )
+        for turbine in sorted(turbines):
             result = recompute_day(conn, turbine, date)
             if result is not None:
                 days.append(result)
+    # 归因变化会影响当月免补累计，日级免补合计与归因在同一事务内更新。
+    _refresh_exemption_months(conn, {date[:7] for date in dates}, changed_dates=dates)
     return days
+
+
+# ---------------------------------------------------------------------------
+# 免补额度
+# ---------------------------------------------------------------------------
+
+
+def _month_of(value: str) -> str:
+    """接受 ``YYYY-MM`` 或 ``YYYY-MM-DD``，返回月份。"""
+    text = str(value or "").strip()
+    if len(text) == 7:
+        try:
+            datetime.strptime(text, "%Y-%m")
+        except ValueError as exc:
+            raise ValidationError(f"月份格式应为 YYYY-MM：{value!r}") from exc
+        return text
+    return parse_date(text, field="日期")[:7]
+
+
+def _quota_mills(conn: sqlite3.Connection, month: str, cause: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT amount FROM exemption_quotas WHERE month = ? AND cause = ?", (month, cause)
+    ).fetchone()
+    if row is None:
+        return None
+    return to_mills(row["amount"])
+
+
+def _attribution_dates(conn: sqlite3.Connection, month: str) -> list[str]:
+    start, end = month_bounds(month)
+    return [
+        row["date"]
+        for row in conn.execute(
+            "SELECT DISTINCT date FROM attribution_slots "
+            "WHERE date >= ? AND date < ? ORDER BY date",
+            (start, end),
+        )
+    ]
+
+
+def _day_turbines(conn: sqlite3.Connection, date: str) -> list[str]:
+    return [
+        row["turbine"]
+        for row in conn.execute(
+            "SELECT DISTINCT turbine FROM attribution_slots WHERE date = ? ORDER BY turbine",
+            (date,),
+        )
+    ]
+
+
+def _slot_losses(
+    conn: sqlite3.Connection, date: str, cause: str
+) -> dict[str, dict[str, int]]:
+    """某日某原因各时刻的逐风机损失（毫单位）。"""
+    slots: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT start_utc, turbine, amount FROM attribution_losses "
+        "WHERE date = ? AND cause = ? ORDER BY start_utc, turbine",
+        (date, cause),
+    ):
+        amount = to_mills(row["amount"])
+        if amount <= 0:
+            continue
+        slots.setdefault(row["start_utc"], {})[row["turbine"]] = amount
+    return slots
+
+
+def _write_exemption_day(
+    conn: sqlite3.Connection,
+    date: str,
+    cause: str,
+    turbines: Sequence[str],
+    result,
+    now: str,
+) -> None:
+    conn.execute("DELETE FROM exemption_days WHERE date = ? AND cause = ?", (date, cause))
+    rows = [
+        (
+            turbine,
+            date,
+            cause,
+            str(from_mills(result.loss.get(turbine, 0))),
+            str(from_mills(result.exempt.get(turbine, 0))),
+            str(from_mills(result.compensable.get(turbine, 0))),
+            now,
+        )
+        for turbine in turbines
+        if result.loss.get(turbine, 0) > 0
+    ]
+    if rows:
+        conn.executemany(
+            "INSERT INTO exemption_days "
+            "(turbine, date, cause, loss, exempt, compensable, computed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+
+def _month_causes(conn: sqlite3.Connection, month: str) -> list[str]:
+    """该月需要核算的原因：已设额度、已归因、已存免补合计的并集。"""
+    start, end = month_bounds(month)
+    causes: set[str] = {
+        row["cause"]
+        for row in conn.execute(
+            "SELECT cause FROM exemption_quotas WHERE month = ?", (month,)
+        )
+    }
+    causes |= {
+        row["cause"]
+        for row in conn.execute(
+            "SELECT DISTINCT cause FROM attribution_losses WHERE date >= ? AND date < ?",
+            (start, end),
+        )
+    }
+    causes |= {
+        row["cause"]
+        for row in conn.execute(
+            "SELECT DISTINCT cause FROM exemption_days WHERE date >= ? AND date < ?",
+            (start, end),
+        )
+    }
+    return sorted(causes)
+
+
+def _recompute_exemption_range(
+    conn: sqlite3.Connection,
+    month: str,
+    cause: str,
+    *,
+    start_date: Optional[str] = None,
+) -> None:
+    """从 ``start_date``（含）起到月末重算某原因的免补日级合计。
+
+    月内更早的日期不再读取逐格归因，只累加已存的日级免补合计；
+    若发现更早日期有归因但缺少已存合计（旧库首次纳入），则从月初补算。
+    """
+    month_start, month_end = month_bounds(month)
+    start_date = max(month_start, start_date or month_start)
+    if start_date >= month_end:
+        return
+
+    quota = _quota_mills(conn, month, cause)
+    dates = _attribution_dates(conn, month)
+
+    # 月内更早日期只读已存日级合计；若该月尚未完整核算过（旧库首次纳入），
+    # 从月初补算，保证累计起点正确。
+    if start_date > month_start:
+        ready = conn.execute(
+            "SELECT 1 FROM exemption_months WHERE month = ? AND cause = ?", (month, cause)
+        ).fetchone()
+        if ready is None:
+            start_date = month_start
+
+    remaining = quota or 0
+    if start_date > month_start:
+        for row in conn.execute(
+            "SELECT exempt FROM exemption_days WHERE date >= ? AND date < ? AND cause = ?",
+            (month_start, start_date, cause),
+        ):
+            remaining -= to_mills(row["exempt"])
+    remaining = max(0, remaining)
+
+    in_range = [date for date in dates if start_date <= date < month_end]
+    in_range_set = set(in_range)
+    # 归因结果已删除/迁走的日期，免补合计也要一并清除。
+    for row in conn.execute(
+        "SELECT DISTINCT date FROM exemption_days WHERE date >= ? AND date < ? AND cause = ?",
+        (start_date, month_end, cause),
+    ):
+        if row["date"] not in in_range_set:
+            conn.execute(
+                "DELETE FROM exemption_days WHERE date = ? AND cause = ?", (row["date"], cause)
+            )
+
+    now = datetime.now(timezone.utc).strftime(FMT)
+    for date in in_range:
+        turbines = _day_turbines(conn, date)
+        slot_losses = _slot_losses(conn, date, cause)
+        if not slot_losses:
+            conn.execute(
+                "DELETE FROM exemption_days WHERE date = ? AND cause = ?", (date, cause)
+            )
+            continue
+        result = compute_day(turbines, slot_losses, remaining)
+        remaining = result.remaining_after
+        _write_exemption_day(conn, date, cause, turbines, result, now)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO exemption_months (month, cause, computed_at) VALUES (?, ?, ?)",
+        (month, cause, now),
+    )
+
+
+def _refresh_exemption_months(
+    conn: sqlite3.Connection,
+    months: Iterable[str],
+    *,
+    changed_dates: Optional[Iterable[str]] = None,
+) -> None:
+    """归因变化后重算受影响月份中、变化日及之后日期的免补合计。"""
+    dates = sorted(set(changed_dates or ()))
+    for month in sorted(set(months)):
+        month_start, _ = month_bounds(month)
+        month_dates = [date for date in dates if date[:7] == month]
+        start_date = max(month_start, min(month_dates)) if month_dates else None
+        for cause in _month_causes(conn, month):
+            _recompute_exemption_range(conn, month, cause, start_date=start_date)
+
+
+def backfill_exemptions(conn: sqlite3.Connection) -> None:
+    """把旧库既有日报纳入免补核算（应用启动时调用）。
+
+    只补算缺少日级免补合计的月份；已有合计的月份保持原样，
+    后续归因变化走增量重算。
+    """
+    months = {
+        row["date"][:7]
+        for row in conn.execute("SELECT DISTINCT date FROM attribution_slots")
+    }
+    if not months:
+        return
+    done = {
+        (row["month"], row["cause"])
+        for row in conn.execute("SELECT month, cause FROM exemption_months")
+    }
+    with tx(conn):
+        for month in sorted(months):
+            for cause in _month_causes(conn, month):
+                if (month, cause) in done:
+                    continue
+                _recompute_exemption_range(conn, month, cause, start_date=None)
+
+
+def set_exemption_quota(
+    conn: sqlite3.Connection, date: str, cause: str, amount
+) -> dict:
+    """设置某月某原因的全场免补额度，并重算该月日级免补合计。
+
+    ``date`` 可为 ``YYYY-MM-DD``（取所在月）或 ``YYYY-MM``。
+    ``amount`` 必须为非负数且最多 3 位小数（0.001 kWh）。
+    """
+    month = _month_of(date)
+    cause = validate_token(cause, field="限发原因")
+    try:
+        value = to_decimal(amount)
+    except ValueError as exc:
+        raise ValidationError(f"免补额度无效：{exc}") from exc
+    if value < 0:
+        raise ValidationError("免补额度不能为负数")
+    if value != value.quantize(QUANT):
+        raise ValidationError("免补额度最多精确到 0.001 kWh（最多 3 位小数）")
+    value = q(value)
+
+    now = datetime.now(timezone.utc).strftime(FMT)
+    with tx(conn):
+        conn.execute(
+            "INSERT INTO exemption_quotas (month, cause, amount, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(month, cause) DO UPDATE SET "
+            "amount = excluded.amount, updated_at = excluded.updated_at",
+            (month, cause, str(value), now),
+        )
+        _recompute_exemption_range(conn, month, cause, start_date=None)
+
+    return {"month": month, "cause": cause, "amount": value}
+
+
+def get_exemption_quota(
+    conn: sqlite3.Connection, month: str, cause: str
+) -> Optional[Decimal]:
+    row = conn.execute(
+        "SELECT amount FROM exemption_quotas WHERE month = ? AND cause = ?",
+        (_month_of(month), cause),
+    ).fetchone()
+    return to_decimal(row["amount"]) if row else None
+
+
+def list_exemption_quotas(
+    conn: sqlite3.Connection, month: Optional[str] = None
+) -> list[dict]:
+    sql = "SELECT month, cause, amount, updated_at FROM exemption_quotas"
+    params: list = []
+    if month is not None:
+        sql += " WHERE month = ?"
+        params.append(_month_of(month))
+    sql += " ORDER BY month, cause"
+    return [
+        {
+            "month": row["month"],
+            "cause": row["cause"],
+            "amount": to_decimal(row["amount"]),
+            "updated_at": row["updated_at"],
+        }
+        for row in conn.execute(sql, params)
+    ]
+
+
+def list_causes(conn: sqlite3.Connection) -> list[str]:
+    """单据与归因结果中出现过的原因，供页面下拉选择。"""
+    causes = {
+        row["cause"]
+        for row in conn.execute("SELECT DISTINCT cause FROM orders ORDER BY cause")
+    }
+    causes |= {
+        row["cause"]
+        for row in conn.execute("SELECT DISTINCT cause FROM attribution_losses")
+    }
+    causes |= {
+        row["cause"]
+        for row in conn.execute("SELECT DISTINCT cause FROM exemption_quotas")
+    }
+    return sorted(causes)
+
+
+def get_exemption_day(
+    conn: sqlite3.Connection, date: str, cause: str
+) -> dict:
+    """核算某日某原因各风机的免补/可补电量。
+
+    所选日读取逐格归因（按时刻累计）；月内更早日期只读已存的日级合计。
+    只读查询，不写库。
+    """
+    with snapshot(conn):
+        return _get_exemption_day(conn, date, cause)
+
+
+def _get_exemption_day(conn: sqlite3.Connection, date: str, cause: str) -> dict:
+    date = parse_date(date, field="日期")
+    cause = validate_token(cause, field="限发原因")
+    month = date[:7]
+    month_start, _ = month_bounds(month)
+
+    quota = _quota_mills(conn, month, cause)
+    prior_exempt = 0
+    prior_loss = 0
+    for row in conn.execute(
+        "SELECT loss, exempt FROM exemption_days WHERE date >= ? AND date < ? AND cause = ?",
+        (month_start, date, cause),
+    ):
+        prior_loss += to_mills(row["loss"])
+        prior_exempt += to_mills(row["exempt"])
+
+    quota_amount = from_mills(quota or 0)
+    remaining = max(0, (quota or 0) - prior_exempt)
+    turbines = _day_turbines(conn, date)
+    result = compute_day(turbines, _slot_losses(conn, date, cause), remaining)
+
+    rows = [
+        {
+            "turbine": turbine,
+            "loss": from_mills(result.loss.get(turbine, 0)),
+            "exempt": from_mills(result.exempt.get(turbine, 0)),
+            "compensable": from_mills(result.compensable.get(turbine, 0)),
+        }
+        for turbine in sorted(turbines)
+    ]
+    slots = [
+        {
+            "start_utc": item.start_utc,
+            "loss": from_mills(item.loss_total),
+            "exempt": from_mills(item.exempt_total),
+            "remaining_after": from_mills(item.remaining_after),
+        }
+        for item in result.slots
+    ]
+    return {
+        "date": date,
+        "month": month,
+        "cause": cause,
+        "quota": quota_amount,
+        "has_quota": quota is not None,
+        "prior_loss": from_mills(prior_loss),
+        "prior_exempt": from_mills(prior_exempt),
+        "remaining_before": from_mills(remaining),
+        "remaining_after": from_mills(result.remaining_after),
+        "turbines": rows,
+        "slots": slots,
+        "total_loss": from_mills(sum(result.loss.values())),
+        "total_exempt": from_mills(sum(result.exempt.values())),
+        "total_compensable": from_mills(sum(result.compensable.values())),
+    }
+
+
+def get_turbine_exemptions(
+    conn: sqlite3.Connection, turbine: str, date: str
+) -> list[dict]:
+    """某风机某日已存的原因级免补合计（日级展示用，不重算命）。"""
+    with snapshot(conn):
+        return [
+            {
+                "cause": row["cause"],
+                "loss": to_decimal(row["loss"]),
+                "exempt": to_decimal(row["exempt"]),
+                "compensable": to_decimal(row["compensable"]),
+                "computed_at": row["computed_at"],
+            }
+            for row in conn.execute(
+                "SELECT cause, loss, exempt, compensable, computed_at FROM exemption_days "
+                "WHERE turbine = ? AND date = ? ORDER BY cause",
+                (turbine, date),
+            )
+        ]
 
 
 def _refresh_conflicted_orders(
@@ -555,7 +978,12 @@ def list_turbines(conn: sqlite3.Connection) -> list[str]:
 
 
 def list_days(conn: sqlite3.Connection, turbine: str) -> list[dict]:
-    """按日汇总：各原因损失、待查合计、待查格数。"""
+    """按日汇总：各原因损失、待查合计、免补/可补日级合计。"""
+    with snapshot(conn):
+        return _list_days(conn, turbine)
+
+
+def _list_days(conn: sqlite3.Connection, turbine: str) -> list[dict]:
     date_rows = conn.execute(
         "SELECT DISTINCT date FROM attribution_slots WHERE turbine = ? ORDER BY date",
         (turbine,),
@@ -587,6 +1015,18 @@ def list_days(conn: sqlite3.Connection, turbine: str) -> list[dict]:
             if to_decimal(slot["unsplit"]) > 0:
                 unsplit_count += 1
 
+        exempt = q(0)
+        compensable = q(0)
+        exempt_causes: list[str] = []
+        for item in conn.execute(
+            "SELECT cause, exempt, compensable FROM exemption_days "
+            "WHERE turbine = ? AND date = ? ORDER BY cause",
+            (turbine, date),
+        ):
+            exempt += to_decimal(item["exempt"])
+            compensable += to_decimal(item["compensable"])
+            exempt_causes.append(item["cause"])
+
         days.append(
             {
                 "date": date,
@@ -595,12 +1035,20 @@ def list_days(conn: sqlite3.Connection, turbine: str) -> list[dict]:
                 "unsplit_count": unsplit_count,
                 "curtailment": q(curtailment),
                 "slot_count": slot_count,
+                "exempt": q(exempt),
+                "compensable": q(compensable),
+                "exempt_causes": exempt_causes,
             }
         )
     return days
 
 
 def get_day(conn: sqlite3.Connection, turbine: str, date: str) -> Optional[dict]:
+    with snapshot(conn):
+        return _get_day(conn, turbine, date)
+
+
+def _get_day(conn: sqlite3.Connection, turbine: str, date: str) -> Optional[dict]:
     day_row = conn.execute(
         "SELECT * FROM attribution_days WHERE turbine = ? AND date = ?", (turbine, date)
     ).fetchone()

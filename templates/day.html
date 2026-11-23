@@ -21,6 +21,26 @@
     </div>
   {% endif %}
 
+  {% if exemptions %}
+  <h2>免补 / 可补（日级合计）</h2>
+  <p class="hint">
+    按“月份 + 原因”的全场额度逐时刻抵扣；这里是该风机的日级合计。点击原因查看全场核算。
+  </p>
+  <table class="data compact">
+    <thead><tr><th>原因</th><th class="num">本原因损失</th><th class="num">免补</th><th class="num">可补</th></tr></thead>
+    <tbody>
+      {% for e in exemptions %}
+      <tr>
+        <td><a href="{{ url_for('exemption', date=day.date, cause=e.cause) }}">{{ e.cause }}</a></td>
+        <td class="num">{{ e.loss }}</td>
+        <td class="num">{{ e.exempt }}</td>
+        <td class="num {% if e.compensable > 0 %}warn{% endif %}">{{ e.compensable }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
   <h2>覆盖本日的限发单</h2>
   {% if day.orders %}
   <table class="data compact">

@@ -20,8 +20,8 @@ from flask import (
 )
 
 from . import service
-from .db import connect, init_db
-from .parsing import day_bounds, parse_meter_csv
+from .db import connect, init_db, snapshot
+from .parsing import day_bounds, parse_date, parse_meter_csv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB = BASE_DIR / "instance" / "curtailment.sqlite3"
@@ -43,6 +43,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     path = app.config.get("DATABASE") or db_path()
     app.config["DATABASE"] = str(path)
     init_db(path)
+    startup_conn = connect(app.config["DATABASE"])
+    try:
+        service.backfill_exemptions(startup_conn)
+    finally:
+        startup_conn.close()
 
     def get_db() -> sqlite3.Connection:
         if "db" not in g:
@@ -91,11 +96,12 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/")
     def index():
         conn = get_db()
-        turbines = service.list_turbines(conn)
-        selected = request.args.get("turbine") or (turbines[0] if turbines else None)
-        days = service.list_days(conn, selected) if selected else []
-        orders = service.list_orders(conn)
-        paused = [o for o in orders if o["conflicted"]]
+        with snapshot(conn):
+            turbines = service.list_turbines(conn)
+            selected = request.args.get("turbine") or (turbines[0] if turbines else None)
+            days = service.list_days(conn, selected) if selected else []
+            orders = service.list_orders(conn)
+            paused = [o for o in orders if o["conflicted"]]
         return render_template(
             "index.html",
             turbines=turbines,
@@ -143,11 +149,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             day_bounds(date)
         except (ValueError, TypeError):
             abort(404)
-        day = service.get_day(conn, turbine, date)
-        if day is None:
-            flash(f"{turbine} 在 {date} 没有归因结果（可能未导入计量数据）", "warning")
-            return redirect(url_for("index", turbine=turbine))
-        return render_template("day.html", day=day)
+        with snapshot(conn):
+            day = service.get_day(conn, turbine, date)
+            if day is None:
+                flash(f"{turbine} 在 {date} 没有归因结果（可能未导入计量数据）", "warning")
+                return redirect(url_for("index", turbine=turbine))
+            exemptions = service.get_turbine_exemptions(conn, turbine, date)
+        return render_template("day.html", day=day, exemptions=exemptions)
 
     @app.get("/orders")
     def orders():
@@ -207,6 +215,58 @@ def create_app(test_config: dict | None = None) -> Flask:
             "success",
         )
         return redirect(url_for("order_detail", order_no=result.order_no))
+
+    @app.get("/exemption")
+    def exemption():
+        conn = get_db()
+        date_text = (request.args.get("date") or "").strip()
+        cause = (request.args.get("cause") or "").strip()
+        report = None
+        error = None
+        # 额度、日级合计与逐格归因在同一只读快照里读取。
+        with snapshot(conn):
+            causes = service.list_causes(conn)
+            quotas = service.list_exemption_quotas(conn)
+            if date_text and cause:
+                try:
+                    report = service.get_exemption_day(conn, date_text, cause)
+                except ValueError as exc:
+                    error = getattr(exc, "errors", [str(exc)])
+                    error = "；".join(error) if isinstance(error, list) else error
+            elif date_text:
+                try:
+                    parse_date(date_text)
+                except ValueError as exc:
+                    error = str(exc)
+        return render_template(
+            "exemption.html",
+            date=date_text,
+            cause=cause,
+            causes=causes,
+            quotas=quotas,
+            report=report,
+            error=error,
+        )
+
+    @app.post("/exemption/quota")
+    def set_quota():
+        conn = get_db()
+        date_text = (request.form.get("date") or "").strip()
+        cause = (request.form.get("cause") or "").strip()
+        amount = (request.form.get("amount") or "").strip()
+        try:
+            service.set_exemption_quota(conn, date_text, cause, amount)
+        except (service.ValidationError, ValueError) as exc:
+            errors = getattr(exc, "errors", [str(exc)])
+            for message in errors:
+                flash(message, "error")
+            return (
+                redirect(url_for("exemption", date=date_text or None, cause=cause or None))
+                if date_text
+                else redirect(url_for("exemption"))
+            )
+        flash(f"已保存 {date_text[:7]} {cause} 的免补额度 {amount} kWh，并重算该月日级合计", "success")
+        return redirect(url_for("exemption", date=date_text, cause=cause))
 
     @app.errorhandler(400)
     def bad_request(exc):

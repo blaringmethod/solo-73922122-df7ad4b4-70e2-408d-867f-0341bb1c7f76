@@ -52,6 +52,22 @@ def next_date(date_text: str) -> str:
     return (datetime.strptime(date_text, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
 
 
+def parse_date(value: str, *, field: str = "日期") -> str:
+    """解析 ``YYYY-MM-DD`` 形式的 UTC 日期。"""
+    text = str(value or "").strip()
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{field}格式应为 YYYY-MM-DD：{value!r}") from exc
+
+
+def month_bounds(month: str) -> tuple[str, str]:
+    """``YYYY-MM`` -> ``(本月第一日, 下月第一日)``。"""
+    start = datetime.strptime(month + "-01", "%Y-%m-%d").date()
+    end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return start.isoformat(), end.isoformat()
+
+
 def day_bounds(date_text: str) -> tuple[str, str]:
     start = f"{date_text}T00:00:00Z"
     end = f"{next_date(date_text)}T00:00:00Z"

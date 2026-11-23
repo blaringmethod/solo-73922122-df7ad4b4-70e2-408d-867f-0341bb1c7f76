@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}免补电量核算{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>免补电量核算</h1>
+  <p class="hint">
+    免补额度按“月份 + 限发原因”设置，全场共用，每月从零累计。按 UTC 时刻升序，
+    用各风机已归因的该原因损失抵扣额度；额度用尽后的损失计为可补。
+    某一时刻损失总量超过剩余额度时，按各风机该格损失比例分摊剩余额度
+    （最大余数法补尾差，余数相同按风机编号升序）。
+  </p>
+
+  {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+  <form method="get" action="{{ url_for('exemption') }}" class="grid-form">
+    <label>UTC 日期
+      <input type="date" name="date" value="{{ date }}" required>
+    </label>
+    <label>限发原因
+      <input name="cause" value="{{ cause }}" list="cause-list" required placeholder="电网调度">
+    </label>
+    <datalist id="cause-list">
+      {% for c in causes %}<option value="{{ c }}">{% endfor %}
+    </datalist>
+    <button type="submit">查看该日核算</button>
+  </form>
+
+  <h2>设置当月额度</h2>
+  <form method="post" action="{{ url_for('set_quota') }}" class="grid-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>UTC 日期（取所在月）
+      <input type="date" name="date" value="{{ date }}" required>
+    </label>
+    <label>限发原因
+      <input name="cause" value="{{ cause }}" list="cause-list" required>
+    </label>
+    <label>全场当月免补额度 (kWh，非负，最多 3 位小数)
+      <input name="amount" inputmode="decimal" required placeholder="1000.000">
+    </label>
+    <button type="submit">保存并重算当月</button>
+  </form>
+</section>
+
+<section class="card">
+  <h1>{% if report %}{{ report.date }} · {{ report.cause }} 免补核算{% else %}当日核算{% endif %}</h1>
+  {% if report %}
+    <div class="summary">
+      <div><span class="label">当月额度</span><strong>{% if report.has_quota %}{{ report.quota }}{% else %}未设置{% endif %}</strong></div>
+      <div><span class="label">日前已免补</span><strong>{{ report.prior_exempt }}</strong></div>
+      <div><span class="label">当日可用余额</span><strong>{{ report.remaining_before }}</strong></div>
+      <div><span class="label">当日本原因损失</span><strong>{{ report.total_loss }}</strong></div>
+      <div><span class="label">当日免补</span><strong>{{ report.total_exempt }}</strong></div>
+      <div class="{% if report.total_compensable > 0 %}warn{% endif %}"><span class="label">当日可补</span><strong>{{ report.total_compensable }}</strong></div>
+      <div><span class="label">日终剩余额度</span><strong>{{ report.remaining_after }}</strong></div>
+    </div>
+    {% if not report.has_quota %}
+      <div class="flash warning">该月该原因尚未设置免补额度，当日全部损失都按可补处理。</div>
+    {% endif %}
+
+    <h2>各风机当日免补 / 可补</h2>
+    {% if report.turbines %}
+    <table class="data">
+      <thead>
+        <tr><th>风机</th><th class="num">本原因损失</th><th class="num">免补</th><th class="num">可补</th></tr>
+      </thead>
+      <tbody>
+        {% for row in report.turbines %}
+        <tr>
+          <td><a href="{{ url_for('day_detail', turbine=row.turbine, date=report.date) }}">{{ row.turbine }}</a></td>
+          <td class="num">{{ row.loss }}</td>
+          <td class="num">{{ row.exempt }}</td>
+          <td class="num {% if row.compensable > 0 %}warn{% endif %}">{{ row.compensable }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <th>合计</th>
+          <th class="num">{{ report.total_loss }}</th>
+          <th class="num">{{ report.total_exempt }}</th>
+          <th class="num">{{ report.total_compensable }}</th>
+        </tr>
+      </tfoot>
+    </table>
+    {% else %}
+      <p class="empty">该日没有 {{ report.cause }} 的归因损失。</p>
+    {% endif %}
+
+    {% if report.slots %}
+    <h2>逐时刻额度消耗</h2>
+    <p class="hint">所列时刻为该日有 {{ report.cause }} 损失的格；余额按 UTC 时刻累计。</p>
+    <table class="data compact">
+      <thead><tr><th>时刻 (UTC)</th><th class="num">损失总量</th><th class="num">免补</th><th class="num">余额</th></tr></thead>
+      <tbody>
+        {% for slot in report.slots %}
+        <tr>
+          <td>{{ slot.start_utc }}</td>
+          <td class="num">{{ slot.loss }}</td>
+          <td class="num">{{ slot.exempt }}</td>
+          <td class="num">{{ slot.remaining_after }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  {% else %}
+    <p class="empty">选择 UTC 日期与限发原因后查看当日各风机的免补和可补电量。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h1>已设置的免补额度</h1>
+  {% if quotas %}
+  <table class="data compact">
+    <thead><tr><th>月份</th><th>原因</th><th class="num">全场额度 (kWh)</th><th>更新时间</th></tr></thead>
+    <tbody>
+      {% for quota in quotas %}
+      <tr>
+        <td><a href="{{ url_for('exemption', date=quota.month ~ '-01', cause=quota.cause) }}">{{ quota.month }}</a></td>
+        <td>{{ quota.cause }}</td>
+        <td class="num">{{ quota.amount }}</td>
+        <td>{{ quota.updated_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="empty">还没有设置免补额度。</p>
+  {% endif %}
+</section>
+{% endblock %}
